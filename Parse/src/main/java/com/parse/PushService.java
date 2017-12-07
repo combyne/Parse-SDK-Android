@@ -9,24 +9,23 @@
 package com.parse;
 
 import android.app.Service;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.os.IBinder;
+import android.os.PowerManager;
+import android.util.SparseArray;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * A service to listen for push notifications. This operates in the same process as the parent
  * application.
  * <p/>
- * The {@code PushService} can listen to pushes from two different sources: Google Cloud Messaging
- * (GCM) or Parse's own push network. Parse will inspect your application's manifest at runtime and
- * determine which service to use for push. We recommend using GCM for push on devices that have
- * Google Play Store support. Parse uses its own push network for apps that want to avoid a
- * dependency on the Google Play Store, and for devices (like Kindles) which do not have Play Store
- * support.
- * <p/>
+ * The {@code PushService} can listen to pushes from Google Cloud Messaging (GCM).
  * To configure the {@code PushService} for GCM, ensure these permission declarations are present in
  * your AndroidManifest.xml as children of the <code>&lt;manifest&gt;</code> element:
  * <p/>
@@ -43,8 +42,9 @@ import java.util.List;
  * </pre>
  * <p/>
  * Replace YOUR_PACKAGE_NAME in the declarations above with your application's package name. Also,
- * make sure that com.parse.GcmBroadcastReceiver and com.parse.PushService are declared as children
- * of the <code>&lt;application&gt;</code> element:
+ * make sure that {@link GcmBroadcastReceiver}, {@link PushService} and
+ * {@link ParsePushBroadcastReceiver} are declared as children of the
+ * <code>&lt;application&gt;</code> element:
  * <p/>
  * <pre>
  * &lt;service android:name="com.parse.PushService" /&gt;
@@ -56,25 +56,6 @@ import java.util.List;
  *     &lt;category android:name="YOUR_PACKAGE_NAME" /&gt;
  *   &lt;/intent-filter&gt;
  * &lt;/receiver&gt;
- * </pre>
- * <p/>
- * Again, replace YOUR_PACKAGE_NAME with your application's package name.
- * <p/>
- * To configure the PushService for Parse's push network, ensure these permission declarations are
- * present in your AndroidManifest.xml as children of the <code>&lt;manifest&gt;</code> element:
- * <p/>
- * <pre>
- * &lt;uses-permission android:name="android.permission.INTERNET" /&gt;
- * &lt;uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" /&gt;
- * &lt;uses-permission android:name="android.permission.VIBRATE" /&gt;
- * &lt;uses-permission android:name="android.permission.WAKE_LOCK" /&gt;
- * </pre>
- * <p/>
- * Also, make sure that {@link PushService} and {@link ParsePushBroadcastReceiver} are declared as
- * children of the <code>&lt;application&gt;</code> element:
- * <p/>
- * <pre>
- * &lt;service android:name="com.parse.PushService" /&gt;
  * &lt;receiver android:name="com.parse.ParsePushBroadcastReceiver" android:exported=false&gt;
  *  &lt;intent-filter&gt;
  *     &lt;action android:name="com.parse.push.intent.RECEIVE" /&gt;
@@ -84,10 +65,8 @@ import java.util.List;
  * &lt;/receiver&gt;
  * </pre>
  * <p/>
- * Note that you can configure the push service for both GCM and Parse's network by adding all the
- * declarations above to your application's manifest. In this case, Parse will use GCM on devices
- * with Play Store support and fall back to using Parse's network on devices without Play Store
- * support. If you want to customize the way your app generates Notifications for your pushes, you
+ * Again, replace YOUR_PACKAGE_NAME with your application's package name.
+ * If you want to customize the way your app generates Notifications for your pushes, you
  * can register a custom subclass of {@link ParsePushBroadcastReceiver}.
  * <p/>
  * Once push notifications are configured in the manifest, you can subscribe to a push channel by
@@ -102,14 +81,62 @@ import java.util.List;
  * The {@link ParsePushBroadcastReceiver} listens to this intent to track an app open event and
  * launch the app's launcher activity. To customize this behavior override
  * {@link ParsePushBroadcastReceiver#onPushOpen(Context, Intent)}.
+ *
+ * Starting with Android O, this is replaced by {@link PushServiceApi26}.
  */
 public final class PushService extends Service {
   private static final String TAG = "com.parse.PushService";
 
-  /* package */ static final String ACTION_START_IF_REQUIRED =
-      "com.parse.PushService.startIfRequired";
+  //region run and dispose
 
-  private static boolean loggedStartError = false;
+  private static final String WAKE_LOCK_EXTRA = "parseWakeLockId";
+  private static final SparseArray<ParseWakeLock> wakeLocks = new SparseArray<>();
+  private static int wakeLockId = 0;
+
+  /*
+   * Same as Context.startService, but acquires a wake lock before starting the service. The wake
+   * lock must later be released by calling dispose().
+   */
+  static boolean run(Context context, Intent intent) {
+    String reason = intent.toString();
+    ParseWakeLock wl = ParseWakeLock.acquireNewWakeLock(context, PowerManager.PARTIAL_WAKE_LOCK, reason, 0);
+
+    synchronized (wakeLocks) {
+      intent.putExtra(WAKE_LOCK_EXTRA, wakeLockId);
+      wakeLocks.append(wakeLockId, wl);
+      wakeLockId++;
+    }
+
+    intent.setClass(context, PushService.class);
+    ComponentName name = context.startService(intent);
+    if (name == null) {
+      PLog.e(TAG, "Could not start the service. Make sure that the XML tag "
+          + "<service android:name=\"" + PushService.class + "\" /> is in your "
+          + "AndroidManifest.xml as a child of the <application> element.");
+      dispose(intent);
+      return false;
+    }
+    return true;
+  }
+
+  static void dispose(Intent intent) {
+    if (intent != null && intent.hasExtra(WAKE_LOCK_EXTRA)) {
+      int id = intent.getIntExtra(WAKE_LOCK_EXTRA, -1);
+      ParseWakeLock wakeLock;
+
+      synchronized (wakeLocks) {
+        wakeLock = wakeLocks.get(id);
+        wakeLocks.remove(id);
+      }
+
+      if (wakeLock == null) {
+        PLog.e(TAG, "Got wake lock id of " + id + " in intent, but no such lock found in " +
+            "global map. Was disposePushService called twice for the same intent?");
+      } else {
+        wakeLock.release();
+      }
+    }
+  }
 
   //region ServiceLifecycleCallbacks used for testing
 
@@ -129,49 +156,34 @@ public final class PushService extends Service {
     }
   }
 
-  /* package */ static void unregisterServiceLifecycleCallbacks(
-      ServiceLifecycleCallbacks callbacks) {
+  /* package */ static void unregisterServiceLifecycleCallbacks(ServiceLifecycleCallbacks callbacks) {
     synchronized (PushService.class) {
       serviceLifecycleCallbacks.remove(callbacks);
-      if (serviceLifecycleCallbacks.size() <= 0) {
-        serviceLifecycleCallbacks = null;
-      }
     }
   }
 
   private static void dispatchOnServiceCreated(Service service) {
-    Object[] callbacks = collectServiceLifecycleCallbacks();
-    if (callbacks != null) {
-      for (Object callback : callbacks) {
-        ((ServiceLifecycleCallbacks) callback).onServiceCreated(service);
+    if (serviceLifecycleCallbacks != null) {
+      for (ServiceLifecycleCallbacks callback : serviceLifecycleCallbacks) {
+        callback.onServiceCreated(service);
       }
     }
   }
 
   private static void dispatchOnServiceDestroyed(Service service) {
-    Object[] callbacks = collectServiceLifecycleCallbacks();
-    if (callbacks != null) {
-      for (Object callback : callbacks) {
-        ((ServiceLifecycleCallbacks) callback).onServiceDestroyed(service);
+    if (serviceLifecycleCallbacks != null) {
+      for (ServiceLifecycleCallbacks callback : serviceLifecycleCallbacks) {
+        callback.onServiceDestroyed(service);
       }
     }
-  }
-
-  private static Object[] collectServiceLifecycleCallbacks() {
-    Object[] callbacks = null;
-    synchronized (PushService.class) {
-      if (serviceLifecycleCallbacks == null) {
-        return null;
-      }
-      if (serviceLifecycleCallbacks.size() > 0) {
-        callbacks = serviceLifecycleCallbacks.toArray();
-      }
-    }
-    return callbacks;
   }
 
   //endregion
-  
+
+  // We delegate the intent to a PushHandler running in a streamlined executor.
+  private ExecutorService executor;
+  private PushHandler handler;
+
   /**
    * Client code should not construct a PushService directly.
    */
@@ -179,47 +191,19 @@ public final class PushService extends Service {
     super();
   }
 
-  /* package */ static void startServiceIfRequired(Context context) {
-    switch (ManifestInfo.getPushType()) {
-      case PPNS:
-        ParseInstallation installation = ParseInstallation.getCurrentInstallation();
-
-        // If we need to downgrade the installation from GCM to PPNS, make sure to clear out the GCM
-        // info in the installation and send it back up to the server.
-        if (installation.getPushType() == PushType.GCM) {
-          PLog.w(TAG, "Detected a client that used to use GCM and is now using PPNS.");
-
-          installation.removePushType();
-          installation.removeDeviceToken();
-          installation.saveEventually();
-        }
-
-        ServiceUtils.runIntentInService(
-            context, new Intent(PushService.ACTION_START_IF_REQUIRED), PushService.class);
-        break;
-      case GCM:
-        GcmRegistrar.getInstance().registerAsync();
-        break;
-      default:
-        if (!loggedStartError) {
-          PLog.e(TAG, "Tried to use push, but this app is not configured for push due to: " +
-              ManifestInfo.getNonePushTypeLogMessage());
-          loggedStartError = true;
-        }
-        break;
-    }
+  // For tests
+  void setPushHandler(PushHandler handler) {
+    this.handler = handler;
   }
 
-  /* package */ static void stopServiceIfRequired(Context context) {
-    switch (ManifestInfo.getPushType()) {
-      case PPNS:
-        context.stopService(new Intent(context, PushService.class));
-        break;
-      // We don't need to stop anything for GCM since PushService will only be short lived
-    }
+  /**
+   * Called at startup at the moment of parsing the manifest, to see
+   * if it was correctly set-up.
+   */
+  static boolean isSupported() {
+    return ManifestInfo.getServiceInfo(PushService.class) != null;
   }
 
-  private ProxyService proxy;
 
   /**
    * Client code should not call {@code onCreate} directly.
@@ -227,7 +211,7 @@ public final class PushService extends Service {
   @Override
   public void onCreate() {
     super.onCreate();
-    if (ParsePlugins.Android.get().applicationContext() == null) {
+    if (ParsePlugins.Android.get() == null) {
       PLog.e(TAG, "The Parse push service cannot start because Parse.initialize "
           + "has not yet been called. If you call Parse.initialize from "
           + "an Activity's onCreate, that call should instead be in the "
@@ -237,23 +221,9 @@ public final class PushService extends Service {
       stopSelf();
       return;
     }
-    
-    switch (ManifestInfo.getPushType()) {
-      case PPNS:
-        proxy = PPNSUtil.newPPNSService(this);
-        break;
-      case GCM:
-        proxy = new GCMService(this);
-        break;
-      default:
-        PLog.e(TAG, "PushService somehow started even though this device doesn't support push.");
-        break;
-    }
 
-    if (proxy != null) {
-      proxy.onCreate();
-    }
-
+    executor = Executors.newSingleThreadExecutor();
+    handler = PushServiceUtils.createPushHandler();
     dispatchOnServiceCreated(this);
   }
 
@@ -261,16 +231,24 @@ public final class PushService extends Service {
    * Client code should not call {@code onStartCommand} directly.
    */
   @Override
-  public int onStartCommand(Intent intent, int flags, int startId) {
-    switch (ManifestInfo.getPushType()) {
-      case PPNS:
-      case GCM:
-        return proxy.onStartCommand(intent, flags, startId);
-      default:
-        PLog.e(TAG, "Started push service even though no push service is enabled: " + intent);
-        ServiceUtils.completeWakefulIntent(intent);
-        return START_NOT_STICKY;
+  public int onStartCommand(final Intent intent, int flags, final int startId) {
+    if (ManifestInfo.getPushType() == PushType.NONE) {
+      PLog.e(TAG, "Started push service even though no push service is enabled: " + intent);
     }
+
+    executor.execute(new Runnable() {
+      @Override
+      public void run() {
+        try {
+          handler.handlePush(intent);
+        } finally {
+          dispose(intent);
+          stopSelf(startId);
+        }
+      }
+    });
+
+    return START_NOT_STICKY;
   }
 
   /**
@@ -287,12 +265,13 @@ public final class PushService extends Service {
    */
   @Override
   public void onDestroy() {
-    if (proxy != null) {
-      proxy.onDestroy();
+    if (executor != null) {
+      executor.shutdown();
+      executor = null;
+      handler = null;
     }
 
     dispatchOnServiceDestroyed(this);
-
     super.onDestroy();
   }
 }
